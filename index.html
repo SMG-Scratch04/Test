@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>地震情報ビューワ</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Hiragino Kaku Gothic ProN", "メイリオ", sans-serif; margin: 16px; background:#f7f9fc; color:#111; }
+    header { display:flex; gap:12px; align-items:center; margin-bottom:12px; }
+    .card { background:#fff; border-radius:8px; padding:12px; box-shadow:0 1px 4px rgba(20,30,40,0.06); }
+    label { font-size:13px; color:#444; display:block; margin-bottom:6px; }
+    input[type=text], input[type=url], select { width:100%; padding:8px 10px; border:1px solid #e0e6ef; border-radius:6px; font-size:14px; }
+    button { padding:8px 12px; border-radius:6px; border:none; background:#0366d6; color:#fff; cursor:pointer; }
+    button.secondary { background:#6c757d; }
+    .grid { display:grid; grid-template-columns:1fr 320px; gap:12px; align-items:start; }
+    .list { margin-top:10px; display:flex; flex-direction:column; gap:8px; }
+    .event { padding:10px; border-left:6px solid #0366d6; background:#fbfcfe; border-radius:6px; }
+    .small { font-size:13px; color:#666; }
+    #map { height:300px; border-radius:8px; overflow:hidden; background:#e6eefc; display:flex; align-items:center; justify-content:center; color:#0b47a1; }
+    .badge { display:inline-block; padding:4px 8px; background:#eef5ff; color:#083e8a; border-radius:6px; font-weight:600; }
+    footer { margin-top:14px; font-size:13px; color:#666; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 class="card" style="margin:0; padding:10px 14px;">地震情報ビューワ</h1>
+    <div style="display:flex; gap:8px;">
+      <button id="startBtn" class="card">取得開始</button>
+      <button id="stopBtn" class="card secondary">停止</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="card" aria-label="設定">
+      <h2 style="margin:0 0 10px 0">取得設定</h2>
+
+      <label>API エンドポイント（GET）</label>
+      <input id="apiUrl" type="url" placeholder="https://example.com/earthquake/latest.json" />
+
+      <label style="margin-top:10px">更新間隔（秒）</label>
+      <input id="intervalSec" type="text" value="10" />
+
+      <label style="margin-top:10px">レスポンス内のイベント配列パス（例: events, data）</label>
+      <input id="arrayPath" type="text" placeholder="events" value="events" />
+
+      <label style="margin-top:10px">イベント内フィールド（カンマ区切り）</label>
+      <div class="small" style="margin-bottom:6px">時刻, マグニチュード, 緯度, 経度, 震度 のフィールド名を順に指定してください</div>
+      <input id="fieldMap" type="text" placeholder="time,magnitude,lat,lon,intensity" value="time,magnitude,latitude,longitude,intensity" />
+
+      <div style="display:flex; gap:8px; margin-top:12px;">
+        <button id="saveBtn">保存</button>
+        <button id="loadExample">例をセット</button>
+      </div>
+
+      <div style="margin-top:12px;">
+        <div class="small">メッセージ: <span id="status">停止中</span></div>
+      </div>
+    </section>
+
+    <aside>
+      <div class="card" id="map">地図プレースホルダ（任意でLeaflet等を組込んでください）</div>
+
+      <div class="card" style="margin-top:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <strong>最新イベント</strong>
+          <span class="small">更新: <span id="lastUpdate">--</span></span>
+        </div>
+        <div class="list" id="eventsList" aria-live="polite" style="margin-top:10px; max-height:360px; overflow:auto;"></div>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="small">
+    このページはGitHub Pagesにそのまま置ける静的HTMLです。APIレスポンスの構造に合わせてフィールド名と配列パスを設定してください。
+  </footer>
+
+  <script>
+    // 基本動作:
+    // - 指定した URL に GET でアクセスして JSON を取得する
+    // - "配列パス"に従って配列を取り出し、先頭のイベントを最新とみなして表示
+    // - fieldMap で指定した順序に従って表示フィールドを取り出す
+    // 注意: クロスオリジン(CORS)制約があるAPIはブラウザから直接取得できません。必要なら中継サーバを用意してください。
+
+    const apiUrlInput = document.getElementById('apiUrl');
+    const intervalInput = document.getElementById('intervalSec');
+    const arrayPathInput = document.getElementById('arrayPath');
+    const fieldMapInput = document.getElementById('fieldMap');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const saveBtn = document.getElementById('saveBtn');
+    const loadExampleBtn = document.getElementById('loadExample');
+    const statusEl = document.getElementById('status');
+    const eventsList = document.getElementById('eventsList');
+    const lastUpdateEl = document.getElementById('lastUpdate');
+
+    let timer = null;
+    let lastSeenId = null;
+
+    function getNested(obj, path) {
+      if (!path) return undefined;
+      const parts = path.split('.');
+      let cur = obj;
+      for (const p of parts) {
+        if (cur == null) return undefined;
+        cur = cur[p];
+      }
+      return cur;
+    }
+
+    function parseField(eventObj, fieldName) {
+      if (!fieldName) return undefined;
+      // allow nested path like source.time
+      return getNested(eventObj, fieldName);
+    }
+
+    async function fetchAndRender() {
+      const url = apiUrlInput.value.trim();
+      if (!url) return;
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const json = await res.json();
+
+        const arrPath = arrayPathInput.value.trim();
+        const arr = arrPath ? getNested(json, arrPath) : json;
+        if (!Array.isArray(arr)) {
+          statusEl.textContent = 'レスポンスに配列が見つかりません';
+          return;
+        }
+        if (arr.length === 0) {
+          statusEl.textContent = 'イベント配列が空です';
+          return;
+        }
+
+        // 最新イベントを先頭と仮定
+        const eventObj = arr[0];
+
+        // id判定（存在すれば重複防止に使用）
+        const eventId = parseField(eventObj, 'id') || parseField(eventObj, 'event_id') || JSON.stringify(parseField(eventObj, 'time') || eventObj);
+
+        if (eventId === lastSeenId) {
+          statusEl.textContent = '更新なし: ' + new Date().toLocaleTimeString();
+          return;
+        }
+
+        lastSeenId = eventId;
+
+        const fields = fieldMapInput.value.split(',').map(s => s.trim());
+        const [timeF, magF, latF, lonF, intensityF] = fields;
+
+        const timeVal = parseField(eventObj, timeF) ?? '不明';
+        const magVal  = parseField(eventObj, magF) ?? '—';
+        const latVal  = parseField(eventObj, latF);
+        const lonVal  = parseField(eventObj, lonF);
+        const intensityVal = parseField(eventObj, intensityF) ?? '—';
+
+        showEvent({
+          id: eventId,
+          time: timeVal,
+          magnitude: magVal,
+          lat: latVal,
+          lon: lonVal,
+          intensity: intensityVal,
+          raw: eventObj
+        });
+
+      } catch (err) {
+        statusEl.textContent = '取得エラー: ' + (err.message || err);
+      }
+    }
+
+    function showEvent(ev) {
+      const wrap = document.createElement('div');
+      wrap.className = 'event';
+      const t = document.createElement('div');
+      t.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center">
+        <div><strong>${ev.time}</strong> <span class="small">ID:${ev.id}</span></div>
+        <div><span class="badge">M ${ev.magnitude}</span></div>
+      </div>
+      <div class="small" style="margin-top:8px">場所: ${ev.lat ?? '不明'}, ${ev.lon ?? '不明'}  震度: ${ev.intensity}</div>`;
+
+      wrap.appendChild(t);
+      eventsList.prepend(wrap);
+      // 表示の上限
+      while (eventsList.children.length > 30) eventsList.removeChild(eventsList.lastChild);
+
+      statusEl.textContent = '新着受信: ' + new Date().toLocaleTimeString();
+      lastUpdateEl.textContent = new Date().toLocaleString();
+
+      // 地図プレースホルダに更新座標を表示（実用時は Leaflet などを組込む）
+      const map = document.getElementById('map');
+      if (ev.lat != null && ev.lon != null) {
+        map.textContent = `緯度: ${ev.lat} ／ 経度: ${ev.lon}`;
+      } else {
+        map.textContent = '位置情報なし';
+      }
+
+      // 受信時の音や通知はブラウザの仕様に注意（ここではサウンドは再生しない）
+    }
+
+    function startPolling() {
+      if (timer) return;
+      const sec = Math.max(5, Number(intervalInput.value) || 10);
+      statusEl.textContent = '取得中';
+      fetchAndRender();
+      timer = setInterval(fetchAndRender, sec * 1000);
+    }
+
+    function stopPolling() {
+      if (timer) { clearInterval(timer); timer = null; }
+      statusEl.textContent = '停止中';
+    }
+
+    startBtn.addEventListener('click', () => startPolling());
+    stopBtn.addEventListener('click', () => stopPolling());
+    saveBtn.addEventListener('click', () => {
+      const cfg = {
+        apiUrl: apiUrlInput.value,
+        intervalSec: intervalInput.value,
+        arrayPath: arrayPathInput.value,
+        fieldMap: fieldMapInput.value
+      };
+      localStorage.setItem('eqViewerCfg', JSON.stringify(cfg));
+      statusEl.textContent = '設定を保存しました';
+    });
+
+    loadExampleBtn.addEventListener('click', () => {
+      // 例: P2P quake style の想定フィールド名をセット（利用するAPIに合わせて調整してください）
+      apiUrlInput.value = 'https://api.example.com/earthquakes/latest.json';
+      intervalInput.value = '10';
+      arrayPathInput.value = 'events';
+      fieldMapInput.value = 'time,magnitude,latitude,longitude,intensity';
+      statusEl.textContent = '例をセットしました。APIを実際のエンドポイントに変更してください';
+    });
+
+    // 保存設定の復元
+    (function loadCfg(){
+      try {
+        const raw = localStorage.getItem('eqViewerCfg');
+        if (!raw) return;
+        const c = JSON.parse(raw);
+        apiUrlInput.value = c.apiUrl || '';
+        intervalInput.value = c.intervalSec || '10';
+        arrayPathInput.value = c.arrayPath || 'events';
+        fieldMapInput.value = c.fieldMap || 'time,magnitude,latitude,longitude,intensity';
+      } catch(e){}
+    })();
+  </script>
+</body>
+</html>
